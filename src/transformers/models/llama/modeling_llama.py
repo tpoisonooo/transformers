@@ -20,6 +20,7 @@
 """ PyTorch LLaMA model."""
 import math
 import os
+import pdb
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -48,6 +49,15 @@ def verify_onnx(filepath, inkv, outv):
     for k, v in inkv.items():
         cpu_inputs[k] = v.to('cpu').numpy()
 
+    # if 'past' in filepath:
+    #     import pdb
+    #     pdb.set_trace()
+    #     kin = cpu_inputs['past_key_in']
+    #     kin = np.zeros((1,32,0,128), kin.dtype)
+    #     vin = np.zeros((1,32,0,128), kin.dtype)
+    #     cpu_inputs['past_key_in'] = kin
+    #     cpu_inputs['past_value_in'] = vin
+
     cpu_outputs = ort_session.run(None, cpu_inputs)
     diff = np.allclose(cpu_outputs[0], outv.to('cpu').numpy())
     logger.error('******   {} diff  {}'.format(filepath, diff))
@@ -60,6 +70,8 @@ def _make_causal_mask(
     """
     Make causal mask used for bi-directional self-attention.
     """
+#    import pdb
+#    pdb.set_trace()
     bsz, tgt_len = input_ids_shape
     mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min, device=device), device=device)
     mask_cond = torch.arange(mask.size(-1), device=device)
@@ -543,12 +555,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+            # pdb.set_trace()
 
-
-            onnx_filepath = '/workspace/llama.onnx/embed.onnx'
+            onnx_filepath = '/workspace/llama.onnx/7B/embed.onnx'
             if not os.path.exists(onnx_filepath):
                 onnx_dynamic_axes = {"input": {1: "N"}}
-                torch.onnx.export(model=self.embed_tokens, args=input_ids, f=onnx_filepath, verbose=True, input_names=["input"], output_names=["embed"], dynamic_axes=onnx_dynamic_axes)
+                torch.onnx.export(model=self.embed_tokens, args=input_ids, f=onnx_filepath, verbose=False, input_names=["input"], output_names=["embed"], dynamic_axes=onnx_dynamic_axes)
                 verify_onnx(onnx_filepath, {'input': input_ids}, inputs_embeds)
 
         # embed positions
@@ -606,25 +618,30 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache
                 )
 
+
                 onnx_out_names = ("hidden_out", "past_key", "past_value")
                 if past_key_value is None:
-                    onnx_filepath = '/workspace/llama.onnx/decoder-{}.onnx'.format(idx)
+                    onnx_filepath = '/workspace/llama.onnx/7B/decoder-{}.onnx'.format(idx)
                     onnx_inp_names = ("hidden_in", "attn_mask", "position_ids")
+                    onnx_dynamic_axes = {"hidden_in": {1: "N"}, "attn_mask": {2:"N", 3:"N"}, "position_ids": {1:"N"}}
+                    
 
                     if not os.path.exists(onnx_filepath):
                         onnx_inputs = (hidden_states,attention_mask,position_ids,None,False,True)
 
-                        torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=True, input_names=onnx_inp_names, output_names=onnx_out_names)
+                        torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=False, input_names=onnx_inp_names, output_names=onnx_out_names, dynamic_axes=onnx_dynamic_axes)
                         verify_onnx(onnx_filepath, {"hidden_in":hidden_states, 'attn_mask':attention_mask, 'position_ids': position_ids}, layer_outputs[0])
 
                 else:
-                    onnx_filepath = '/workspace/llama.onnx/decoder-past-{}.onnx'.format(idx)
+                    # pdb.set_trace()
+                    onnx_filepath = '/workspace/llama.onnx/7B/decoder-past-{}.onnx'.format(idx)
                     onnx_inp_names = ("hidden_in", "attn_mask", "position_ids", "past_key_in", "past_value_in")
+                    onnx_dynamic_axes = {"attn_mask": {3:"N"}, "past_key_in": {2:"last_N"}, "past_value_in": {2:"last_N"}}
 
                     if not os.path.exists(onnx_filepath):
                         onnx_inputs = (hidden_states,attention_mask,position_ids,past_key_value,False,True)
 
-                        torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=True, input_names=onnx_inp_names, output_names=onnx_out_names)
+                        torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=False, input_names=onnx_inp_names, output_names=onnx_out_names, dynamic_axes=onnx_dynamic_axes)
                         verify_onnx(onnx_filepath, {"hidden_in":hidden_states, 'attn_mask':attention_mask, 'position_ids': position_ids, 'past_key_in': past_key_value[0], 'past_value_in': past_key_value[1]}, layer_outputs[0])
 
 
@@ -638,9 +655,12 @@ class LlamaModel(LlamaPreTrainedModel):
         
         norm_in = hidden_states.clone() 
         hidden_states = self.norm(hidden_states)
-        onnx_filepath = "/workspace/llama.onnx/norm.onnx"
+        # pdb.set_trace()
+
+        onnx_filepath = "/workspace/llama.onnx/7B/norm.onnx"
         if not os.path.exists(onnx_filepath):
-            torch.onnx.export(model=self.norm, args=(norm_in), f=onnx_filepath, verbose=True, input_names=["input"], output_names=["output"])
+            onnx_dynamic_axes = {"input": {1: "N"}}
+            torch.onnx.export(model=self.norm, args=(norm_in), f=onnx_filepath, verbose=False, input_names=["input"], output_names=["output"], dynamic_axes=onnx_dynamic_axes)
             verify_onnx(onnx_filepath, {"input":norm_in}, hidden_states)
 
         # add hidden states from the last decoder layer
@@ -751,11 +771,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         hidden_states = outputs[0]
 
         logits = self.lm_head(hidden_states)
+        # pdb.set_trace()
 
-        onnx_filepath = '/workspace/llama.onnx/head.onnx'
+        onnx_filepath = '/workspace/llama.onnx/7B/head.onnx'
         if not os.path.exists(onnx_filepath):
             onnx_dynamic_axes = {"input": {1: "N"}}
-            torch.onnx.export(model=self.lm_head, args=(hidden_states), f=onnx_filepath, verbose=True, input_names=["input"], output_names=["output"], dynamic_axes=onnx_dynamic_axes)
+            torch.onnx.export(model=self.lm_head, args=(hidden_states), f=onnx_filepath, verbose=False, input_names=["input"], output_names=["output"], dynamic_axes=onnx_dynamic_axes)
             verify_onnx(onnx_filepath, {"input":hidden_states}, logits)
 
 

@@ -2533,6 +2533,7 @@ class GenerationMixin:
 
             next_token_logits = outputs.logits[:, -1, :]
 
+
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
             next_token_scores = logits_warper(input_ids, next_token_scores)
@@ -2558,6 +2559,8 @@ class GenerationMixin:
             # sample
             probs = nn.functional.softmax(next_token_scores, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            
+            print('**** next token {}'.format(next_tokens))
 
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
@@ -2581,6 +2584,8 @@ class GenerationMixin:
 
             # stop when each sentence is finished, or if we exceed the maximum length
             if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+                import pdb
+                pdb.set_trace()
                 if not synced_gpus:
                     break
                 else:
