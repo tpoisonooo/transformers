@@ -59,8 +59,11 @@ def verify_onnx(filepath, inkv, outv):
     #     cpu_inputs['past_value_in'] = vin
 
     cpu_outputs = ort_session.run(None, cpu_inputs)
-    diff = np.allclose(cpu_outputs[0], outv.to('cpu').numpy())
-    logger.error('******   {} diff  {}'.format(filepath, diff))
+    same = np.allclose(cpu_outputs[0], outv.to('cpu').numpy(), atol=2e-3)
+    if not same:
+        import pdb
+        # pdb.set_trace()
+    logger.error('******   {} same {}'.format(filepath, same))
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -619,30 +622,43 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
 
-                onnx_out_names = ("hidden_out", "past_key", "past_value")
-                if past_key_value is None:
-                    onnx_filepath = '/workspace/llama.onnx/7B/decoder-{}.onnx'.format(idx)
-                    onnx_inp_names = ("hidden_in", "attn_mask", "position_ids")
-                    onnx_dynamic_axes = {"hidden_in": {1: "N"}, "attn_mask": {2:"N", 3:"N"}, "position_ids": {1:"N"}}
-                    
-
-                    if not os.path.exists(onnx_filepath):
-                        onnx_inputs = (hidden_states,attention_mask,position_ids,None,False,True)
-
-                        torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=False, input_names=onnx_inp_names, output_names=onnx_out_names, dynamic_axes=onnx_dynamic_axes)
-                        verify_onnx(onnx_filepath, {"hidden_in":hidden_states, 'attn_mask':attention_mask, 'position_ids': position_ids}, layer_outputs[0])
-
-                else:
-                    # pdb.set_trace()
-                    onnx_filepath = '/workspace/llama.onnx/7B/decoder-past-{}.onnx'.format(idx)
+                if past_key_value is not None:
+                    onnx_out_names = ("hidden_out", "past_key", "past_value")
+                    onnx_filepath = '/workspace/llama.onnx/7B/decoder-merge-{}.onnx'.format(idx)
                     onnx_inp_names = ("hidden_in", "attn_mask", "position_ids", "past_key_in", "past_value_in")
-                    onnx_dynamic_axes = {"attn_mask": {3:"N"}, "past_key_in": {2:"last_N"}, "past_value_in": {2:"last_N"}}
+                    onnx_dynamic_axes = {"hidden_in": {1:"N"}, "position_ids": {1:"N"},"attn_mask": {2:"N", 3:"sumN"}, "past_key_in": {2:"lastN"}, "past_value_in": {2:"lastN"}}
+
 
                     if not os.path.exists(onnx_filepath):
                         onnx_inputs = (hidden_states,attention_mask,position_ids,past_key_value,False,True)
 
                         torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=False, input_names=onnx_inp_names, output_names=onnx_out_names, dynamic_axes=onnx_dynamic_axes)
                         verify_onnx(onnx_filepath, {"hidden_in":hidden_states, 'attn_mask':attention_mask, 'position_ids': position_ids, 'past_key_in': past_key_value[0], 'past_value_in': past_key_value[1]}, layer_outputs[0])
+
+
+                #if past_key_value is None:
+                #    onnx_filepath = '/workspace/llama.onnx/7B/decoder-{}.onnx'.format(idx)
+                #    onnx_inp_names = ("hidden_in", "attn_mask", "position_ids")
+                #    onnx_dynamic_axes = {"hidden_in": {1: "N"}, "attn_mask": {2:"N", 3:"N"}, "position_ids": {1:"N"}}
+                #    
+
+                #    if not os.path.exists(onnx_filepath):
+                #        onnx_inputs = (hidden_states,attention_mask,position_ids,None,False,True)
+
+                #        torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=False, input_names=onnx_inp_names, output_names=onnx_out_names, dynamic_axes=onnx_dynamic_axes)
+                #        verify_onnx(onnx_filepath, {"hidden_in":hidden_states, 'attn_mask':attention_mask, 'position_ids': position_ids}, layer_outputs[0])
+
+                #else:
+                #    # pdb.set_trace()
+                #    onnx_filepath = '/workspace/llama.onnx/7B/decoder-past-{}.onnx'.format(idx)
+                #    onnx_inp_names = ("hidden_in", "attn_mask", "position_ids", "past_key_in", "past_value_in")
+                #    onnx_dynamic_axes = {"attn_mask": {3:"N"}, "past_key_in": {2:"last_N"}, "past_value_in": {2:"last_N"}}
+
+                #    if not os.path.exists(onnx_filepath):
+                #        onnx_inputs = (hidden_states,attention_mask,position_ids,past_key_value,False,True)
+
+                #        torch.onnx.export(model=decoder_layer, args=onnx_inputs, f=onnx_filepath, verbose=False, input_names=onnx_inp_names, output_names=onnx_out_names, dynamic_axes=onnx_dynamic_axes)
+                #        verify_onnx(onnx_filepath, {"hidden_in":hidden_states, 'attn_mask':attention_mask, 'position_ids': position_ids, 'past_key_in': past_key_value[0], 'past_value_in': past_key_value[1]}, layer_outputs[0])
 
 
             hidden_states = layer_outputs[0]

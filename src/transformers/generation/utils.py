@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import pdb
 import inspect
 import warnings
 from dataclasses import dataclass
@@ -2532,7 +2533,8 @@ class GenerationMixin:
                 continue  # don't waste resources running the code we don't need
 
             next_token_logits = outputs.logits[:, -1, :]
-
+            # import pdb
+            # pdb.set_trace()
 
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
