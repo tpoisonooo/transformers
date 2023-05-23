@@ -36,6 +36,47 @@ from .configuration_llama import LlamaConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
+OBSERVER_MIN_SCALE = 1e-8
+
+
+class PercentileObserver:
+    def __init__(self, ratio: float = 0.95):
+        self._percentile_collector = []
+        self._percentile = ratio
+    
+    @ torch.no_grad()
+    def observe(self, value):
+        numel = value.numel()
+        min_idx, max_idx = int(numel * (1 - self._percentile)), int(numel * (self._percentile))
+        # torch.kthvalue needs index from 1 to numel ...
+        min_idx = max(0, min_idx) + 1
+        max_idx = min(max_idx, numel - 1) + 1
+        _min = torch.kthvalue(value.flatten(), k = min_idx, dim=0)[0].view(1, -1)
+        _max = torch.kthvalue(value.flatten(), k = max_idx, dim=0)[0].view(1, -1)
+        self._percentile_collector.append(torch.cat([_max, _min], dim=-1))
+    
+    def minmax_to_scale_offset(
+        self,
+        min_val: float, max_val: float,
+        scale_threshold: float=OBSERVER_MIN_SCALE
+    ) -> Tuple[float, float]:
+        
+        range = 2 * float(max(abs(max_val), abs(min_val)))
+        scale  = range / 255
+        if scale < scale_threshold and OBSERVER_WARNING: 
+            print('there is a scale value < 1e-7, ')
+        scale = max(scale, scale_threshold)
+        offset = 0
+        return scale, offset
+
+    def param(self):
+        device = self._percentile_collector[-1].device
+        collector = torch.cat(self._percentile_collector, dim=0).float().mean(dim=0).cpu()
+
+        min_ = collector[1].item()
+        max_ = collector[0].item()
+        scale, offset = self.minmax_to_scale_offset(min_val = min_, max_val = max_)
+        return min_, max_, scale, offset
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -81,11 +122,14 @@ class LlamaRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 
-        return (self.weight * hidden_states).to(input_dtype)
+        # convert into half-precision if necessary
+        if self.weight.dtype in [torch.float16, torch.bfloat16]:
+            hidden_states = hidden_states.to(self.weight.dtype)
+
+        return self.weight * hidden_states
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -176,6 +220,8 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        self.past_key_quantizer = PercentileObserver()
+        self.past_value_quantizer = PercentileObserver()
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -201,13 +247,16 @@ class LlamaAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
-
+        # /root/miniconda3/envs/torch2/lib/python3.10/site-packages/transformers-4.30.0.dev0-py3.10.egg/transformers/models/llama/modeling_llama.py
         if past_key_value is not None:
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
+        self.past_key_quantizer.observe(key_states)
+        print('past_key_quantizer observe')
+        self.past_value_quantizer.observe(value_states)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -223,9 +272,7 @@ class LlamaAttention(nn.Module):
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(
-                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            )
+            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
