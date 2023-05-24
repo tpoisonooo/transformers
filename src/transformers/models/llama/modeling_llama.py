@@ -39,6 +39,56 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 OBSERVER_MIN_SCALE = 1e-8
 
 
+def torch_snr_error(y_pred: torch.Tensor, y_real: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
+    """
+    Compute SNR between y_pred(tensor) and y_real(tensor)
+    
+    SNR can be calcualted as following equation:
+    
+        SNR(pred, real) = (pred - real) ^ 2 / (real) ^ 2
+    
+    if x and y are matrixs, SNR error over matrix should be the mean value of SNR error over all elements.
+    
+        SNR(pred, real) = mean((pred - real) ^ 2 / (real) ^ 2)
+    Args:
+        y_pred (torch.Tensor): _description_
+        y_real (torch.Tensor): _description_
+        reduction (str, optional): _description_. Defaults to 'mean'.
+    Raises:
+        ValueError: _description_
+        ValueError: _description_
+    Returns:
+        torch.Tensor: _description_
+    """
+    y_pred = y_pred.type(torch.float32)
+    y_real = y_real.type(torch.float32)
+
+    if y_pred.shape != y_real.shape:
+        raise ValueError(f'Can not compute snr loss for tensors with different shape. '
+                         f'({y_pred.shape} and {y_real.shape})')
+    reduction = str(reduction).lower()
+
+    if y_pred.ndim == 1:
+        y_pred = y_pred.unsqueeze(0)
+        y_real = y_real.unsqueeze(0)
+
+    y_pred = y_pred.flatten(start_dim=1)
+    y_real = y_real.flatten(start_dim=1)
+
+    noise_power = torch.pow(y_pred - y_real, 2).sum(dim=-1)
+    signal_power = torch.pow(y_real, 2).sum(dim=-1)
+    snr = (noise_power) / (signal_power + 1e-7)
+
+    if reduction == 'mean':
+        return torch.mean(snr)
+    elif reduction == 'sum':
+        return torch.sum(snr)
+    elif reduction == 'none':
+        return snr
+    else:
+        raise ValueError(f'Unsupported reduction method.')
+
+
 class PercentileObserver:
     def __init__(self, ratio: float = 0.95):
         self._percentile_collector = []
@@ -77,6 +127,106 @@ class PercentileObserver:
         max_ = collector[0].item()
         scale, offset = self.minmax_to_scale_offset(min_val = min_, max_val = max_)
         return min_, max_, scale, offset
+
+# copy from ppq
+class HistObserver:
+    def __init__(self):
+        self._hist  = None
+        self._hist_scale = None
+        self._hist_bins  = 2048
+        self._min_val_collector = []
+        self._max_val_collector = []
+    
+    @ torch.no_grad()
+    def observe(self, value):
+        self._min_val_collector.append(value.min().reshape(shape=[1, ]))
+        self._max_val_collector.append(value.max().reshape(shape=[1, ]))
+    
+
+    def hist_to_scale_offset(
+        self, histogram: torch.Tensor, hist_bins: int, hist_scale: float,
+        scale_threshold: float=OBSERVER_MIN_SCALE
+    ) -> Tuple[float, float]:
+
+        def torch_KL_divergence(hist: torch.Tensor, ref_hist: torch.Tensor, eps=1e-30) -> float:
+            if hist.ndim != 1 or ref_hist.ndim != 1: raise ValueError(
+                'Only 1 dimension tensor can compute KL divergence with another tensor. '\
+                f'While your input hist has dimension {hist.ndim} and ref_hist has dimension {ref_hist.ndim}')
+            if len(hist) != len(ref_hist): raise ValueError(
+                'Can not compute KL divergence, len(hist) != len(ref_hist')
+
+            # here we compute KL divergence at float64 precision, make sure your hist and ref_hist are stored at cpu.
+            # otherwise it might be very slow.
+            return torch.dot(hist.double(), torch.log10(hist.double() + eps) - torch.log10(ref_hist.double() + eps)).item()
+        
+        # move histogram to cpu, speedup computation.
+        histogram = histogram.to("cuda").float()
+
+        # compute symmtrical kl-divergence.
+        # Here is a simple example: reference distribution P consisting of 8 bins, we want to quantize into 2 bins:
+        # P = [ 1, 0, 2, 3, 5, 3, 1, 7]
+        # we merge into 2 bins (8 / 2 = 4 consecutive bins are merged into one bin)
+        # [1 + 0 + 2 + 3 , 5 + 3 + 1 + 7] = [6, 16]
+        # then proportionally expand back to 8 bins, we preserve empty bins from the original distribution P:
+        # Q = [ 6/3, 0, 6/3, 6/3, 16/4, 16/4, 16/4, 16/4] = [ 2, 0, 2, 2, 4, 4, 4, 4]
+        # now we should normalize both distributions, after that we can compute KL_divergence
+        # P /= sum(P) Q /= sum(Q)
+        # result = KL_divergence(P, Q)
+        # see also
+        # https://github.com/NVIDIA/TensorRT/blob/3835424af081db4dc8cfa3ff3c9f4a8b89844421/tools/pytorch-quantization/pytorch_quantization/calib/histogram.py#L147
+
+        losses, quant_bins = [], 2 ** (config.num_of_bits - 1)
+
+        # following code is curcial, do not remove
+        histogram[: int(hist_bins * .002)] = 0
+        histogram[int(hist_bins * .002)] = 1
+
+        hist_sum = torch.sum(histogram)
+        for bin_range in range(quant_bins, hist_bins + quant_bins - 1, quant_bins):
+            p_hist = torch.zeros(size=(bin_range, ), dtype=torch.float, device=computing_device)
+            p_hist[: bin_range].copy_(histogram[: bin_range])
+            p_hist[bin_range - 1] += torch.sum(histogram[bin_range: ])
+            p_hist = p_hist / hist_sum
+
+            expand_ratio = int(bin_range / quant_bins)
+            q_hist = histogram[: bin_range].clone()
+            q_hist = q_hist.reshape((quant_bins, expand_ratio))
+            positive_map = q_hist > 0
+            positive_cnt = positive_map.sum(axis=1, keepdim=True)
+            positive_cnt[positive_cnt == 0] = 1
+            q_hist = torch.div(q_hist.sum(axis=1, keepdim=True), positive_cnt)
+            q_hist = q_hist.repeat([1, expand_ratio])
+            q_hist = q_hist * positive_map
+            q_hist = q_hist / torch.sum(q_hist)
+            q_hist = q_hist.flatten()
+
+            losses.append({
+                'kl': torch_KL_divergence(p_hist, q_hist),
+                'bin_range': bin_range
+            })
+
+        best_bin_range = sorted(losses, key=lambda x: x['kl'])[0]['bin_range']
+        scale, offset = (best_bin_range / self._hist_bins) * hist_scale * (self._hist_bins / quant_bins), 0
+        
+        if scale < scale_threshold and OBSERVER_WARNING: 
+            print('scale value < 1e-7')
+        scale = max(scale, scale_threshold)
+        return scale, offset
+
+    def param(self):
+        min_val = torch.cat(self._min_val_collector, dim=0)
+        max_val = torch.cat(self._max_val_collector, dim=0)
+        value = torch.abs(torch.cat([min_val, max_val], dim=0))
+        value = value.dtype(torch.float32)
+
+        # symmetrical
+        abs_max = float(torch.max(value).cpu().item())
+        self._hist_scale = abs_max / self._hist_bins
+
+        self._hist = torch.histc(torch.abs(value), self._hist_bins, min=0, max=abs_max).int()
+
+        scale, offset = self.hist_to_scale_offset(histogram=self._hist, hist_bins=self._hist_bins, hist_scale=self._hist_scale)
+        return scale, offset
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -202,7 +352,7 @@ class LlamaMLP(nn.Module):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, layerid: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -222,6 +372,17 @@ class LlamaAttention(nn.Module):
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
         self.past_key_quantizer = PercentileObserver()
         self.past_value_quantizer = PercentileObserver()
+        
+        import numpy as np
+        import os
+        self.past_k_scale = None
+        self.past_v_scale = None
+        self.layer_id = layerid
+        if os.path.exists('past_kv.npy'):
+            x = np.load('past_kv.npy')
+            self.past_k_scale = x[layerid][0]
+            self.past_v_scale = x[layerid][1]
+            print('layerid {} load k_scale {} v_scale {}'.format(layerid, self.past_k_scale, self.past_v_scale))
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -246,6 +407,19 @@ class LlamaAttention(nn.Module):
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        def fake_quant(_type, x, scale):
+            y = x.type(torch.float32)
+            y = (torch.round(y / scale) * scale).type(x.dtype)
+            error = torch_snr_error(x, y)
+            if error > 1e-4:
+                print('layerid {} SNR {} {}'.format(self.layer_id, _type, error))
+            return y
+
+        if self.past_k_scale is not None:
+            key_states = fake_quant('k', key_states, self.past_k_scale)
+        if self.past_v_scale is not None:
+            value_states = fake_quant('v', value_states, self.past_v_scale)
         # [bsz, nh, t, hd]
         # /root/miniconda3/envs/torch2/lib/python3.10/site-packages/transformers-4.30.0.dev0-py3.10.egg/transformers/models/llama/modeling_llama.py
         if past_key_value is not None:
@@ -254,9 +428,8 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
-        self.past_key_quantizer.observe(key_states)
-        print('past_key_quantizer observe')
-        self.past_value_quantizer.observe(value_states)
+        # self.past_key_quantizer.observe(key_states)
+        # self.past_value_quantizer.observe(value_states)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -296,10 +469,10 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, layerid: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        self.self_attn = LlamaAttention(config=config, layerid=layerid)
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -489,7 +662,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config, layerid) for layerid in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
