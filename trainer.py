@@ -36,7 +36,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
-
 # Integrations must be imported before ML frameworks:
 # isort: off
 from .integrations import (
@@ -338,7 +337,7 @@ class Trainer:
             The dataset to use for training. If it is a [`~datasets.Dataset`], columns not accepted by the
             `model.forward()` method are automatically removed.
 
-            Note that if it's a `torch.utils.data.IterableDataset` with some randomization and you are training in a
+            Note that if it's a `torch.utils.data.IterableDatasect` with some randomization and you are training in a
             distributed fashion, your iterable dataset should either use a internal attribute `generator` that is a
             `torch.Generator` for the randomization that must be identical on all processes (and the Trainer will
             manually set the seed of this `generator` at each epoch) or have a `set_epoch()` method that internally
@@ -2545,7 +2544,7 @@ class Trainer:
                         else contextlib.nullcontext
                     )
                     with context():
-                        tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+                        tr_loss_step, domain_loss_dict = self.training_step(model, inputs, num_items_in_batch)
 
                     if (
                         args.logging_nan_inf_filter
@@ -2610,7 +2609,7 @@ class Trainer:
                         self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                         self.control = self.callback_handler.on_step_end(args, self.state, self.control)
                         self._maybe_log_save_evaluate(
-                            tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time
+                            tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, extra=domain_loss_dict
                         )
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
@@ -2636,7 +2635,7 @@ class Trainer:
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time)
+            self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, extra=domain_loss_dict)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_xla_available():
@@ -3056,12 +3055,12 @@ class Trainer:
                 ) from exc
         return metrics
 
-    def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time):
+    def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, extra: Dict={}):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             if is_torch_xla_available():
                 xm.mark_step()
 
-            logs: Dict[str, float] = {}
+            logs: Dict[str, float] = extra
 
             # all_gather + mean() to get average loss over all processes
             tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
@@ -3695,10 +3694,39 @@ class Trainer:
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
         with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-
-
+            loss, outputs = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch, return_outputs=True)
+        
+        def build_domain_loss_dict(domain_losses, source):
+            values = [value.item() for value in outputs.domain_losses]
+            ret = {}
+            for s, v in zip(source, values):
+                source_id = s.item()
+                keymap = {
+                    0: 'arabidosis',
+                    1: 'autoif',
+                    2: 'coding',
+                    3: 'common',
+                    4: 'math',
+                    5: 'others',
+                    6: 'corn',
+                    7: 'rice',
+                    8: 'cognition',
+                    9: 'soybean',
+                    100: 'unknown'
+                }
+                if source_id in keymap:
+                    suffix = keymap[source_id]
+                else:
+                    suffix = 'bad'
+                key = f'loss_{suffix}'
+                ret[key] = v
+                return ret
+        
+        domain_loss_dict = build_domain_loss_dict(outputs.domain_losses, inputs['xsource'])
         del inputs
+        del outputs.domain_losses
+        outputs.domain_losses = None
+
         if (
             self.args.torch_empty_cache_steps is not None
             and self.state.global_step % self.args.torch_empty_cache_steps == 0
@@ -3725,13 +3753,16 @@ class Trainer:
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
+
         if self.use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
+
             # Finally we need to normalize the loss for reporting
             if not self.model_accepts_loss_kwargs and self.compute_loss_func is None:
                 loss = loss / self.args.gradient_accumulation_steps
+                domain_losses = [value / self.args.gradient_accumulation_steps for value in domain_losses]
 
             # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
             # https://github.com/huggingface/transformers/pull/35808
@@ -3739,8 +3770,7 @@ class Trainer:
                 kwargs["scale_wrt_gas"] = False
 
             self.accelerator.backward(loss, **kwargs)
-
-            return loss.detach()
+            return loss.detach(), domain_loss_dict
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -3758,6 +3788,7 @@ class Trainer:
                 loss_kwargs["num_items_in_batch"] = num_items_in_batch
             inputs = {**inputs, **loss_kwargs}
         outputs = model(**inputs)
+
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
