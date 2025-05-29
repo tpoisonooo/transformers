@@ -873,8 +873,23 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
+        domain_losses = []
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            batch_size = logits.size(0)
+            for i in range(batch_size):
+                # 提取第 i 个样本的 logits 和 labels
+                sample_logits = logits[i]
+                sample_labels = labels[i]
+
+                # 调用 ForCausalLMLoss 计算单个样本的损失
+                sample_loss = self.loss_function(
+                    logits=sample_logits.unsqueeze(0),  # 增加 batch 维度
+                    labels=sample_labels.unsqueeze(0),  # 增加 batch 维度
+                    vocab_size=self.config.vocab_size,
+                    **kwargs
+                )
+                domain_losses.append(sample_loss.detach())
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -882,6 +897,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
         return CausalLMOutputWithPast(
             loss=loss,
+            domain_losses=domain_losses,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
