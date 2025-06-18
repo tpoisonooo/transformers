@@ -3712,6 +3712,8 @@ class Trainer:
                     7: 'rice',
                     8: 'cognition',
                     9: 'soybean',
+                    10: 'badcase',
+                    11: 'format',
                     100: 'unknown'
                 }
                 if source_id in keymap:
